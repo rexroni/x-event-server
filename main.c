@@ -4,36 +4,81 @@
 #include <X11/Xutil.h>
 #include <X11/Xos.h>
 
-/* I'm choosing not to use _NET_ACTIVE_WINDOW at all because it doesn't seem to
-   have well-defined behavior of when it is updated vs when focus events
-   happen.  A more robust solution seems to be to just find all windows and
-   watch for the appropriate FocusIn events on all of them. */
-// Atom atom_net_active_window = -1;
-// Window root;
-//
-// Window get_active_window(Display *dpy){
-//     Atom actual_type;
-//     int actual_format;
-//     unsigned long nitems;
-//     unsigned long bytes_after_return;
-//     unsigned char *prop;
-//
-//     int ret = XGetWindowProperty(
-//         dpy, root, atom_net_active_window, 0, 1, False, AnyPropertyType,
-//         &actual_type, &actual_format, &nitems, &bytes_after_return, &prop
-//     );
-//
-//     if(ret != Success){
-//         fprintf(stderr, "failed to get active window\n");
-//         return 0;
-//     }
-//
-//     Window out = *((Window*)prop);
-//
-//     XFree(prop);
-//
-//     return out;
-// }
+static Display *dpy;
+static Atom atom_wm_name;
+static Atom atom_net_wm_name;
+
+/* I'm choosing not to depend on _NET_ACTIVE_WINDOW in general because it
+   doesn't seem to have well-defined behavior of when it is updated vs when
+   focus events happen.  A more robust solution seems to be to just find all
+   windows and watch for the appropriate FocusIn events on all of them.
+
+   But we do use _NET_ACTIVE_WINDOW opportunistically on startup. */
+Atom atom_net_active_window;
+
+// returns 0 if _NET_ACTIVE_WINDOW is not supported.
+Window maybe_get_active_window(Window root){
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems;
+    unsigned long bytes_after_return;
+    unsigned char *prop;
+
+    int ret = XGetWindowProperty(
+        dpy, root, atom_net_active_window, 0, 1, False, AnyPropertyType,
+        &actual_type, &actual_format, &nitems, &bytes_after_return, &prop
+    );
+
+    if(ret != Success){
+        fprintf(stderr, "failed to get active window\n");
+        return 0;
+    }
+
+    Window out = *((Window*)prop);
+
+    XFree(prop);
+
+    return out;
+}
+
+
+// remember if the window manager sets _NET_WM_NAME or the legacy WM_NAME
+// -1 = not sure, 0 = false, 1 = true
+int use_net_wm_name = -1;
+
+char *get_window_title(Window w){
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems;
+    unsigned long bytes_after_return;
+    unsigned char *prop;
+
+    int ret;
+
+    if(use_net_wm_name != 0){
+        // check _NET_WM_NAME
+        ret = XGetWindowProperty(
+            dpy, w, atom_net_wm_name, 0, 1024, False, AnyPropertyType,
+            &actual_type, &actual_format, &nitems, &bytes_after_return, &prop
+        );
+        if(ret == Success) use_net_wm_name = 1;
+    }
+
+    if(use_net_wm_name != 1){
+        // check WM_NAME
+        ret = XGetWindowProperty(
+            dpy, w, atom_wm_name, 0, 1024, False, AnyPropertyType,
+            &actual_type, &actual_format, &nitems, &bytes_after_return, &prop
+        );
+        if(ret == Success) use_net_wm_name = 1;
+    }
+
+    if(ret != Success){
+        return NULL;
+    }
+
+    return (char*)prop;
+}
 
 char *event_type_string(int type){
     switch(type){
@@ -99,7 +144,7 @@ char *focus_event_detail(int detail){
     return "unknown";
 }
 
-int watch_focus_on_children(Display *dpy, Window w){
+int watch_focus_on_children(Window w){
     // printf("watch_focus_on_children(%lu)\n", w);
     Window root;
     Window parent;
@@ -119,9 +164,9 @@ int watch_focus_on_children(Display *dpy, Window w){
     for(int i = 0; i < nchildren; i++){
         Window child = children[i];
         // watch this window
-        XSelectInput(dpy, child, FocusChangeMask);
+        XSelectInput(dpy, child, FocusChangeMask | PropertyChangeMask);
         // recurse to its children
-        ret = watch_focus_on_children(dpy, child);
+        ret = watch_focus_on_children(child);
         if(ret){
             retval = 1;
             break;
@@ -146,19 +191,26 @@ int x_error_handler(Display *dpy, XErrorEvent *xerror){
     return 0;
 }
 
-int run(Display *dpy){
+int run(){
     // EnterWindowMask is for mouse movements, which we don't care about.
     // SubstructureNotifyMask will detect window creations and deletions.
     // FocusChangeMask will detect window focus, but only on the window you
     // apply it to.
 
+    // get the atoms for the properties we care about
+    atom_wm_name = XInternAtom(dpy, "WM_NAME", False);
+    atom_net_wm_name = XInternAtom(dpy, "_NET_WM_NAME", False);
+    atom_net_active_window = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", False);
+
+    // TODO: what would this code actually look like with ScreenCount > 1?
+    // (it's definitely wrong right now)
     int nscreens = ScreenCount(dpy);
     for(int i = 0; i < nscreens; i++){
         Window root = RootWindow(dpy, i);
         // set event mask on the root window, for tracking new windows.
-        XSelectInput(dpy, root, FocusChangeMask | SubstructureNotifyMask);
+        XSelectInput(dpy, root, SubstructureNotifyMask);
         // start watching all existing windows for focus change events
-        int ret = watch_focus_on_children(dpy, root);
+        int ret = watch_focus_on_children(root);
         if(ret) return 1;
     }
 
@@ -168,6 +220,14 @@ int run(Display *dpy){
     XEvent xev;
     XFocusChangeEvent *xfocus;
     XCreateWindowEvent *xcreate;
+    XPropertyEvent *xprop;
+
+    // on startup, we do not know which window is focused.
+    Window focused = maybe_get_active_window(RootWindow(dpy, 0));
+    char *title = focused ? get_window_title(focused) : NULL;
+    if(focused){
+        printf("start: %lu \"%s\"\n", focused, title);
+    }
 
     while(XNextEvent(dpy, &xev) == Success){
         switch(xev.type){
@@ -195,14 +255,57 @@ int run(Display *dpy){
                    as mode==NotifyWhileGrabbed.  So we just detect either. */
                 if(xfocus->mode != NotifyNormal
                         && xfocus->mode != NotifyWhileGrabbed) break;
-                printf("focus: %lu\n", xfocus->window);
+                // remember this window is focused
+                focused = xfocus->window;
+                // get the new window's title
+                XFree(title);
+                title = get_window_title(focused);
+                printf("focus: %lu \"%s\"\n", focused, title);
                 break;
 
             case CreateNotify:
                 xcreate = (XCreateWindowEvent*)&xev;
                 // printf("create window: %lu\n", xcreate->window);
                 // watch the new window for focus changes
-                XSelectInput(dpy, xcreate->window, FocusChangeMask);
+                XSelectInput(dpy, xcreate->window, FocusChangeMask | PropertyChangeMask);
+                break;
+
+            case PropertyNotify:
+                xprop = (XPropertyEvent*)&xev;
+
+                // char *name;
+                // name = XGetAtomName(dpy, xprop->atom);
+                // if(name){
+                //     if(xprop->state == PropertyNewValue){
+                //         // new or changed
+                //         printf("%lu: %s set\n", xprop->window, name);
+                //     }else if (xprop->state == PropertyDelete){
+                //         // deleted
+                //         printf("%lu: %s cleared\n", xprop->window, name);
+                //     }else{
+                //         printf("%lu: %s ??\n", xprop->window, name);
+                //     }
+                //     XFree(name);
+                // }
+
+                // we only care if the focused window has a property change
+                if(xprop->window != focused) break;
+
+                // we only care if _NET_WM_NAME or WM_NAME changed
+                if(use_net_wm_name == -1){
+                    // react to either
+                    if(xprop->atom != atom_net_wm_name && xprop->atom != atom_wm_name)
+                        break;
+                }else if(use_net_wm_name == 0){
+                    if(xprop->atom != atom_wm_name) break;
+                }else if(use_net_wm_name == 1){
+                    if(xprop->atom != atom_net_wm_name) break;
+                }
+
+                XFree(title);
+                title = get_window_title(focused);
+
+                printf("title: %lu \"%s\"\n", focused, title);
                 break;
 
             // ignore these silently
@@ -221,13 +324,13 @@ int run(Display *dpy){
 }
 
 int main(){
-    Display *dpy = XOpenDisplay(NULL);
+    dpy = XOpenDisplay(NULL);
     if(!dpy){
         fprintf(stderr, "failed to open display\n");
         return 1;
     }
 
-    int exitcode = run(dpy);
+    int exitcode = run();
 
     XCloseDisplay(dpy);
 
