@@ -4,6 +4,8 @@
 #include <X11/Xutil.h>
 #include <X11/Xos.h>
 
+#include "hooks.h"
+
 static Display *dpy;
 static Atom atom_wm_name;
 static Atom atom_net_wm_name;
@@ -226,7 +228,7 @@ int run(){
     Window focused = maybe_get_active_window(RootWindow(dpy, 0));
     char *title = focused ? get_window_title(focused) : NULL;
     if(focused){
-        printf("start: %lu \"%s\"\n", focused, title);
+        start_hook(focused, title);
     }
 
     while(XNextEvent(dpy, &xev) == Success){
@@ -260,7 +262,7 @@ int run(){
                 // get the new window's title
                 XFree(title);
                 title = get_window_title(focused);
-                printf("focus: %lu \"%s\"\n", focused, title);
+                focus_hook(focused, title);
                 break;
 
             case CreateNotify:
@@ -304,8 +306,7 @@ int run(){
 
                 XFree(title);
                 title = get_window_title(focused);
-
-                printf("title: %lu \"%s\"\n", focused, title);
+                title_hook(focused, title);
                 break;
 
             // ignore these silently
