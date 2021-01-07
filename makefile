@@ -3,12 +3,15 @@ CFLAGS=-Wall
 CFLAGS+=`pkg-config --cflags x11`
 LDFLAGS=`pkg-config --libs x11`
 
-all: main
+all: x-event-server
 
-main: hooks.o
+x-event-server: hooks.o
+
+install: x-event-server
+	install x-event-server /usr/local/bin/x-event-server
 
 clean:
-	rm -f main *.o
+	rm -f x-event-server *.o
 
-run: main
-	./main
+run: x-event-server
+	./x-event-server
